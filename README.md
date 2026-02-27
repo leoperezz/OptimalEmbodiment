@@ -94,6 +94,53 @@ python scripts/process_amass_data.py \
 
 The exact preprocessing steps (normalization, joint selection, output format, feature computation, etc.) should be implemented inside `scripts/process_amass_data.py` according to the needs of your experiments.
 
+### Visualizing AMASS sequences (SMPL+H)
+
+Given the folder structure used in this project:
+
+```text
+OptimalEmbodiment/
+  data/
+    ACCAD/
+      ... many *.npz motion files ...
+    body_models/
+      smplh/{male,female,neutral}/model.npz
+      dmpls/{male,female,neutral}/model.npz
+```
+
+you can load and visualize an AMASS‑style sequence using the helper classes in `optimal_embodiment.smpl.human` (a light adaptation of the official AMASS visualization notebook):
+
+```python
+from optimal_embodiment.smpl.human import AmassSequence, SmplHuman
+
+# Example: pick one ACCAD file
+npz_path = "data/ACCAD/MartialArtsWalksTurns_c3d/E13_-_block_right_high_stageii.npz"
+
+# Load the motion and body parameters from the .npz
+seq = AmassSequence.from_npz(npz_path)
+print(seq.gender, seq.frame_rate, seq.num_frames)
+
+# Build a SMPL+H model using the body models in data/body_models/
+human = SmplHuman.from_npz(npz_path, body_models_dir="data")
+
+# Render a single frame (uses PyTorch, human_body_prior, body_visualizer, trimesh)
+human.show_frame(frame_idx=0, rotate_front_view=True)
+```
+
+Internally this:
+
+- parses AMASS fields such as `root_orient`, `pose_body`, `pose_hand`, `trans`, `betas`, and `dmpls` from the `.npz` file (or splits `poses` if needed),  
+- loads the appropriate SMPL+H and DMPL models from `data/body_models/smplh/{gender}/model.npz` and `data/body_models/dmpls/{gender}/model.npz`,  
+- calls `human_body_prior.body_model.BodyModel` to obtain vertices, and  
+- uses `body_visualizer` + `trimesh` to render a mesh.
+
+To use `SmplHuman.show_frame` you must have the following Python packages installed in your environment in addition to this project’s core dependencies:
+
+- `human_body_prior`  
+- `body_visualizer`  
+- `trimesh`  
+- `matplotlib`
+
 ### Citation
 
 If you use this project or the AMASS dataset in scientific work, please cite at least:

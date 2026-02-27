@@ -9,7 +9,7 @@ description = "Experimentation framework for the Optimal Embodiment project usin
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-  { name = "Leonardo", email = "you@example.com" }
+  { name = "Leonardo", email = "leo.perez.nestares@gmail.com" }
 ]
 license = { text = "MIT" }
 dependencies = [

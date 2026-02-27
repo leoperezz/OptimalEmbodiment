@@ -50,6 +50,33 @@ OptimalEmbodiment/
 
    The exact structure may vary depending on how you download/extract the dataset, but the idea is to preserve the original AMASS folder names.
 
+### Body models (SMPLH + DMPLS)
+
+For the body models, follow the BlenderProc tutorial **only up to the part where the body model files are mentioned** (for example, the `smplh.tar.xz` and `dmpls.tar.xz` archives) and download those files **manually**.
+
+1. Create the following folder structure inside `data/`:
+
+```text||1
+data/
+  body_models/
+    smplh/
+      male/
+        model.npz      <-- Extracted from smplh.tar.xz
+      female/
+        model.npz      <-- Extracted from smplh.tar.xz
+      neutral/
+        model.npz      <-- Extracted from smplh.tar.xz
+    dmpls/
+      male/
+        model.npz      <-- Extracted from dmpls.tar.xz
+      female/
+        model.npz      <-- Extracted from dmpls.tar.xz
+      neutral/
+        model.npz      <-- Extracted from dmpls.tar.xz
+```
+
+2. Extract the downloaded archives (`smplh.tar.xz`, `dmpls.tar.xz`, etc.) and copy the corresponding `model.npz` files into the folders indicated above.
+
 ### AMASS dataset preprocessing
 
 To obtain the final dataset used by the main algorithm, you should implement a script `scripts/process_amass_data.py` in this repository.

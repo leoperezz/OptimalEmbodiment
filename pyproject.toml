@@ -18,6 +18,8 @@ dependencies = [
   "pandas",
   "tqdm",
   "torch",
+  "dotmap==1.3.30",
+  "tqdm==4.67.3",
 ]
 
 [tool.setuptools]

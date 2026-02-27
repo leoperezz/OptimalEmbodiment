@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "optimal-embodiment"
+version = "0.1.0"
+description = "Experimentation framework for the Optimal Embodiment project using AMASS human motion data."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Leonardo", email = "you@example.com" }
+]
+license = { text = "MIT" }
+dependencies = [
+  "numpy",
+  "scipy",
+  "pandas",
+  "tqdm",
+  "torch",
+]
+
+[tool.setuptools]
+packages = ["optimal_embodiment"]

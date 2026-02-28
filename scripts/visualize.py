@@ -57,8 +57,8 @@ class RobotMotionViewer:
         cam_elevation: float = -10.0,
         record_video: bool = False,
         video_path: str | None = None,
-        video_width: int = 1280,
-        video_height: int = 720,
+        video_width: int = 640,
+        video_height: int = 480,
     ) -> None:
         self.xml_path = xml_path
         self.model = mujoco.MjModel.from_xml_path(str(xml_path))
@@ -281,8 +281,18 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Save an .mp4 alongside the .pkl for each robot.",
     )
-    parser.add_argument("--video-width", type=int, default=1280)
-    parser.add_argument("--video-height", type=int, default=720)
+    parser.add_argument(
+        "--video-width",
+        type=int,
+        default=640,
+        help="Video width (must be ≤ MuJoCo offscreen framebuffer, default 640).",
+    )
+    parser.add_argument(
+        "--video-height",
+        type=int,
+        default=480,
+        help="Video height (must be ≤ MuJoCo offscreen framebuffer, default 480).",
+    )
     return parser.parse_args()
 
 

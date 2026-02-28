@@ -24,6 +24,8 @@ dependencies = [
   "human-body-prior==0.8.5.0",
   "body-visualizer @ git+https://github.com/nghorbani/body_visualizer.git",
   "imageio[ffmpeg]",
+  "mujoco==3.5.0",
+  "dm-control==1.0.37"
 ]
 
 [tool.setuptools]

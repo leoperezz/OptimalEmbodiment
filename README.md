@@ -22,9 +22,27 @@ conda create -n optimal-embodiment python=3.10 -y
 # Activate environment
 conda activate optimal-embodiment
 
-# Install the package in editable mode
+# Install the package in editable mode (includes the GMR dependency from third_party/gmr)
 pip install -e .
 ```
+
+### Local dependency: GMR (General Motion Retargeting)
+
+The project depends on the **GMR** (_General Motion Retargeting_) package, which is included as a local submodule/code in `third_party/gmr/`. This dependency is declared in `pyproject.toml` as a local path dependency:
+
+```toml
+"general_motion_retargeting @ file:./third_party/gmr"
+```
+
+When you run `pip install -e .` from the repository root, pip will automatically install the package from `third_party/gmr/` (using its `setup.py`). You do not need to install GMR manually.
+
+If you ever install dependencies only via `pip install -r requirements.txt` (or without using `pyproject.toml`), then you must install GMR explicitly:
+
+```bash
+pip install -e ./third_party/gmr
+```
+
+Make sure the `third_party/gmr/` directory is available (e.g. by cloning submodules with `git submodule update --init --recursive` if GMR is registered as a submodule).
 
 ### Downloading the AMASS dataset
 

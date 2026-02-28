@@ -25,7 +25,8 @@ dependencies = [
   "body-visualizer @ git+https://github.com/nghorbani/body_visualizer.git",
   "imageio[ffmpeg]",
   "mujoco==3.5.0",
-  "dm-control==1.0.37"
+  "dm-control==1.0.37",
+  "general_motion_retargeting @ file:./third_party/gmr"
 ]
 
 [tool.setuptools]

@@ -1,6 +1,7 @@
 # Custom
 
 data/
+outputs/
 
 # Bytecode y cachés
 __pycache__/

@@ -8,7 +8,7 @@ Optimal Embodiment is a research framework for discovering and evaluating robot 
 
 *Human motion retargeted to a randomized humanoid embodiment (Unitree G1 base).*
 
-<video src="images/video_random.mp4" controls width="100%"></video>
+![Human motion retargeted to randomized humanoid](images/video_random.gif)
 
 ---
 

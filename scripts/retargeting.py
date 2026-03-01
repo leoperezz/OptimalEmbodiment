@@ -454,11 +454,23 @@ def build_random_robot_xml(
     np.random.seed(seed)
     builder = HumanoidBuilder(template_xml=template_xml, ref_mass=25.0, add_head_joints=add_head_joints)
     tree = builder.build()
+    semantic_meta = builder.last_semantic_description
     tree.joint_params["type"] = "free"
 
     xml_str = MuJoCoCompiler().compile(tree)
     output_xml_path.parent.mkdir(parents=True, exist_ok=True)
     output_xml_path.write_text(xml_str, encoding="utf-8")
+
+    if semantic_meta is not None:
+        semantic_path = output_xml_path.with_name("semantic_joint_space.json")
+        payload = {
+            "seed": int(seed),
+            "template_xml": str(template_xml),
+            "add_head_joints": bool(add_head_joints),
+            "semantic": semantic_meta,
+        }
+        with open(semantic_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
 
     return mujoco.MjModel.from_xml_path(str(output_xml_path))
 

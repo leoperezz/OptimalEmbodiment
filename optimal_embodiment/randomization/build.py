@@ -2,11 +2,91 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mujoco
 import mujoco.viewer
 import numpy as np
+
+
+# ==========================================
+# 0. Canonical joint space (Nmax = 32)
+# ==========================================
+
+N_MAX_GLOBAL_JOINTS = 32
+
+GLOBAL_JOINT_NAMES: List[str] = [
+    "left_hip_roll",
+    "left_hip_pitch",
+    "left_hip_yaw",
+    "left_knee_pitch",
+    "left_ankle_roll",
+    "left_ankle_pitch",
+    "right_hip_roll",
+    "right_hip_pitch",
+    "right_hip_yaw",
+    "right_knee_pitch",
+    "right_ankle_roll",
+    "right_ankle_pitch",
+    "waist_pitch",
+    "waist_roll",
+    "waist_yaw",
+    "head_roll",
+    "head_pitch",
+    "head_yaw",
+    "left_shoulder_roll",
+    "left_shoulder_pitch",
+    "left_shoulder_yaw",
+    "left_elbow_pitch",
+    "left_wrist_roll",
+    "left_wrist_pitch",
+    "left_wrist_yaw",
+    "right_shoulder_roll",
+    "right_shoulder_pitch",
+    "right_shoulder_yaw",
+    "right_elbow_pitch",
+    "right_wrist_roll",
+    "right_wrist_pitch",
+    "right_wrist_yaw",
+]
+
+GLOBAL_JOINT_AXES: np.ndarray = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=float,
+)
 
 
 # ==========================================
@@ -22,17 +102,81 @@ class PhysicsConsistentInertia:
     J' = (U L)(U L)^T, with J = L L^T.
     """
 
-    THETA_RANGES = {
-        "alpha": (np.log(0.75), np.log(1.35)),
-        "d1": (np.log(0.70), np.log(1.35)),
-        "d2": (np.log(0.70), np.log(1.35)),
-        "d3": (np.log(0.70), np.log(1.35)),
-        "s12": (-0.12, 0.12),
-        "s23": (-0.12, 0.12),
-        "s13": (-0.12, 0.12),
-        "t1": (-0.06, 0.06),
-        "t2": (-0.06, 0.06),
-        "t3": (-0.06, 0.06),
+    # Table-2 inspired ranges per segment. Multipliers are sampled around 1 and
+    # mapped to Eq. (25): alpha,d* as logs; shear/translation as centered offsets.
+    TABLE2_RANGES: Dict[str, Dict[str, Tuple[float, float]]] = {
+        "shoulder": {
+            "e_alpha": (0.8, 1.4),
+            "d1": (0.8, 1.2),
+            "d2": (0.8, 1.2),
+            "d3": (0.8, 1.2),
+            "s12": (0.9, 1.1),
+            "s23": (0.9, 1.1),
+            "s13": (0.9, 1.1),
+            "t1": (0.8, 1.2),
+            "t2": (0.8, 1.2),
+            "t3": (0.7, 1.3),
+        },
+        "torso": {
+            "e_alpha": (0.8, 1.5),
+            "d1": (0.8, 1.5),
+            "d2": (0.8, 1.4),
+            "d3": (0.8, 1.2),
+            "s12": (0.9, 1.1),
+            "s23": (0.9, 1.1),
+            "s13": (0.9, 1.1),
+            "t1": (0.8, 1.2),
+            "t2": (0.8, 1.2),
+            "t3": (0.7, 1.3),
+        },
+        "pelvis": {
+            "e_alpha": (0.8, 1.5),
+            "d1": (0.8, 1.4),
+            "d2": (0.8, 1.4),
+            "d3": (0.8, 1.2),
+            "s12": (0.9, 1.1),
+            "s23": (0.9, 1.1),
+            "s13": (0.9, 1.1),
+            "t1": (0.8, 1.2),
+            "t2": (0.8, 1.2),
+            "t3": (0.7, 1.3),
+        },
+        "hip": {
+            "e_alpha": (0.8, 1.5),
+            "d1": (0.8, 1.2),
+            "d2": (0.8, 1.2),
+            "d3": (0.5, 1.5),
+            "s12": (0.9, 1.1),
+            "s23": (0.9, 1.1),
+            "s13": (0.9, 1.1),
+            "t1": (0.8, 1.2),
+            "t2": (0.8, 1.2),
+            "t3": (0.7, 1.3),
+        },
+        "knee": {
+            "e_alpha": (0.8, 1.5),
+            "d1": (0.8, 1.2),
+            "d2": (0.8, 1.2),
+            "d3": (0.5, 1.5),
+            "s12": (0.9, 1.1),
+            "s23": (0.9, 1.1),
+            "s13": (0.8, 1.1),
+            "t1": (0.8, 1.2),
+            "t2": (0.8, 1.2),
+            "t3": (0.7, 1.3),
+        },
+        "foot": {
+            "e_alpha": (0.8, 1.4),
+            "d1": (0.5, 1.5),
+            "d2": (0.5, 1.2),
+            "d3": (0.8, 1.2),
+            "s12": (0.9, 1.1),
+            "s23": (0.9, 1.1),
+            "s13": (0.9, 1.1),
+            "t1": (0.8, 1.2),
+            "t2": (0.8, 1.2),
+            "t3": (0.8, 1.2),
+        },
     }
 
     SPD_EPS = 1e-9
@@ -103,10 +247,36 @@ class PhysicsConsistentInertia:
         return mass, com, inertia
 
     @staticmethod
-    def _sample_theta() -> Dict[str, float]:
+    def _inertia_group(name: str) -> str:
+        b = base_name(name)
+        if "pelvis" in b:
+            return "pelvis"
+        if "torso" in b or "waist" in b:
+            return "torso"
+        if "hip" in b:
+            return "hip"
+        if "knee" in b:
+            return "knee"
+        if "ankle" in b or "toe" in b or "foot" in b:
+            return "foot"
+        if any(k in b for k in ("shoulder", "elbow", "wrist", "head", "hand")):
+            return "shoulder"
+        return "torso"
+
+    @classmethod
+    def _sample_theta(cls, link_name: str) -> Dict[str, float]:
+        ranges = cls.TABLE2_RANGES[cls._inertia_group(link_name)]
         return {
-            k: float(np.random.uniform(v[0], v[1]))
-            for k, v in PhysicsConsistentInertia.THETA_RANGES.items()
+            "alpha": float(np.log(np.random.uniform(*ranges["e_alpha"]))),
+            "d1": float(np.log(np.random.uniform(*ranges["d1"]))),
+            "d2": float(np.log(np.random.uniform(*ranges["d2"]))),
+            "d3": float(np.log(np.random.uniform(*ranges["d3"]))),
+            "s12": float(np.random.uniform(*ranges["s12"]) - 1.0),
+            "s23": float(np.random.uniform(*ranges["s23"]) - 1.0),
+            "s13": float(np.random.uniform(*ranges["s13"]) - 1.0),
+            "t1": float(np.random.uniform(*ranges["t1"]) - 1.0),
+            "t2": float(np.random.uniform(*ranges["t2"]) - 1.0),
+            "t3": float(np.random.uniform(*ranges["t3"]) - 1.0),
         }
 
     @staticmethod
@@ -134,6 +304,7 @@ class PhysicsConsistentInertia:
 
     def randomize(
         self,
+        link_name: str,
         base_mass: float,
         base_com: List[float],
         base_inertia: List[float],
@@ -146,7 +317,7 @@ class PhysicsConsistentInertia:
         J = self.pseudo_inertia_from_link(base_mass, base_com, base_inertia)
         L = np.linalg.cholesky(J).T
 
-        theta = self._sample_theta()
+        theta = self._sample_theta(link_name=link_name)
         U, A = self._build_U(theta)
 
         UL = U @ L
@@ -205,8 +376,80 @@ def pair_key(name: str) -> str:
     return base_name(name)
 
 
-def _range_scale(name: str) -> Tuple[float, float]:
-    b = base_name(name)
+GLOBAL_JOINT_TOKEN_TO_INDEX: Dict[str, int] = {
+    "hip_roll_l": 0,
+    "hip_pitch_l": 1,
+    "hip_yaw_l": 2,
+    "knee_l": 3,
+    "knee_pitch_l": 3,
+    "ankle_roll_l": 4,
+    "ankle_pitch_l": 5,
+    "hip_roll_r": 6,
+    "hip_pitch_r": 7,
+    "hip_yaw_r": 8,
+    "knee_r": 9,
+    "knee_pitch_r": 9,
+    "ankle_roll_r": 10,
+    "ankle_pitch_r": 11,
+    "waist_pitch": 12,
+    "waist_roll": 13,
+    "waist_yaw": 14,
+    "head_roll": 15,
+    "head_pitch": 16,
+    "head_yaw": 17,
+    "shoulder_roll_l": 18,
+    "shoulder_pitch_l": 19,
+    "shoulder_yaw_l": 20,
+    "elbow_l": 21,
+    "elbow_pitch_l": 21,
+    "wrist_roll_l": 22,
+    "wrist_pitch_l": 23,
+    "wrist_yaw_l": 24,
+    "shoulder_roll_r": 25,
+    "shoulder_pitch_r": 26,
+    "shoulder_yaw_r": 27,
+    "elbow_r": 28,
+    "elbow_pitch_r": 28,
+    "wrist_roll_r": 29,
+    "wrist_pitch_r": 30,
+    "wrist_yaw_r": 31,
+}
+
+
+def semantic_joint_index(link_name: str, joint_name: Optional[str] = None) -> Optional[int]:
+    if joint_name:
+        tok_joint = canonical_name(joint_name)
+        idx = GLOBAL_JOINT_TOKEN_TO_INDEX.get(tok_joint)
+        if idx is not None:
+            return idx
+    tok_link = canonical_name(link_name)
+    return GLOBAL_JOINT_TOKEN_TO_INDEX.get(tok_link)
+
+
+def map_joint_state_to_global(
+    q_r: Sequence[float],
+    global_indices: Sequence[int],
+    n_max: int = N_MAX_GLOBAL_JOINTS,
+) -> np.ndarray:
+    """
+    Implements Eq. (10): phi_r: R^{N_r} -> R^{N_max} with zero padding.
+    """
+    q_r_arr = np.asarray(q_r, dtype=float).reshape(-1)
+    if q_r_arr.shape[0] != len(global_indices):
+        raise ValueError(
+            f"Length mismatch in joint embedding: len(q_r)={q_r_arr.shape[0]} vs "
+            f"len(global_indices)={len(global_indices)}"
+        )
+    q_global = np.zeros((n_max,), dtype=float)
+    for local_i, global_i in enumerate(global_indices):
+        if global_i < 0 or global_i >= n_max:
+            raise ValueError(f"Out-of-range global index: {global_i}")
+        q_global[global_i] = float(q_r_arr[local_i])
+    return q_global
+
+
+def _range_scale(name: str, joint_name: Optional[str] = None) -> Tuple[float, float]:
+    b = base_name(joint_name) if joint_name is not None else base_name(name)
     for key, val in _RANGE_SCALE.items():
         if key in b:
             return val
@@ -224,19 +467,25 @@ class JointSpaceRandomization:
 
     HIP_JOINTS = ("hip_roll", "hip_yaw", "hip_pitch")
 
-    def _group(self, name: str) -> str:
-        b = base_name(name)
+    @staticmethod
+    def _joint_base(name: str, joint_name: Optional[str] = None) -> str:
+        if joint_name is not None:
+            return base_name(joint_name)
+        return base_name(name)
+
+    def _group(self, name: str, joint_name: Optional[str] = None) -> str:
+        b = self._joint_base(name, joint_name=joint_name)
         for g in ("hip", "knee", "ankle", "shoulder", "elbow", "wrist", "waist", "head"):
             if g in b:
                 return g
         return "default"
 
-    def _is_optional(self, name: str) -> bool:
-        return self._group(name) in self.OPTIONAL_GROUPS
+    def _is_optional(self, name: str, joint_name: Optional[str] = None) -> bool:
+        return self._group(name, joint_name=joint_name) in self.OPTIONAL_GROUPS
 
     @staticmethod
-    def _axis_from_name(name: str) -> List[float]:
-        b = base_name(name)
+    def _axis_from_name(name: str, joint_name: Optional[str] = None) -> List[float]:
+        b = base_name(joint_name) if joint_name is not None else base_name(name)
         if "roll" in b:
             return [1.0, 0.0, 0.0]
         if "yaw" in b:
@@ -267,24 +516,32 @@ class JointSpaceRandomization:
     def sample_joint_profile(
         self,
         name: str,
+        joint_name: Optional[str] = None,
         base_axis: Optional[List[float]] = None,
         hip_group: Optional[Dict[str, Dict[str, List[float]]]] = None,
     ) -> Dict[str, Any]:
-        b = base_name(name)
-        group = self._group(name)
-        lo_s, hi_s = _range_scale(name)
+        b = self._joint_base(name, joint_name=joint_name)
+        group = self._group(name, joint_name=joint_name)
+        lo_s, hi_s = _range_scale(name, joint_name=joint_name)
 
         if group == "hip" and hip_group is not None and b in hip_group["axis"]:
             axis = list(hip_group["axis"][b])
             euler = list(hip_group["euler"][b])
         else:
-            axis = list(base_axis) if base_axis is not None else self._axis_from_name(name)
+            axis = (
+                list(base_axis)
+                if base_axis is not None
+                else self._axis_from_name(name, joint_name=joint_name)
+            )
             euler = [0.0, 0.0, 0.0]
 
         return {
             "type": (
                 "hinge"
-                if (not self._is_optional(name) or np.random.rand() < self.REVOLUTE_PROB)
+                if (
+                    not self._is_optional(name, joint_name=joint_name)
+                    or np.random.rand() < self.REVOLUTE_PROB
+                )
                 else "fixed"
             ),
             "axis": axis,
@@ -303,9 +560,10 @@ class JointSpaceRandomization:
         total_mass: float,
         parent_com_dist: float,
         profile: Optional[Dict[str, Any]] = None,
+        joint_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         if profile is None:
-            profile = self.sample_joint_profile(name)
+            profile = self.sample_joint_profile(name=name, joint_name=joint_name)
 
         j_type = profile["type"]
         axis = list(profile["axis"])
@@ -349,6 +607,7 @@ class TemplateLink:
     mass: float
     com: List[float]
     inertia: List[float]
+    joint_name: Optional[str] = None
     joint_axis: Optional[List[float]] = None
     joint_range_deg: Optional[List[float]] = None
     children: List["TemplateLink"] = field(default_factory=list)
@@ -362,6 +621,7 @@ class LinkDef:
     com: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     inertia: List[float] = field(default_factory=lambda: [0.0] * 6)
     v_size: List[float] = field(default_factory=lambda: [0.05, 0.05, 0.05])
+    joint_name: Optional[str] = None
     joint_params: Dict[str, Any] = field(default_factory=dict)
     euler: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     children: List["LinkDef"] = field(default_factory=list)
@@ -449,11 +709,13 @@ class G1TemplateLoader:
             # fallback for retained auxiliary links (e.g. toes/feet)
             mass, com, inertia = self._fallback_inertial(name)
 
+        joint_name: Optional[str] = None
         joint_axis: Optional[List[float]] = None
         joint_range_deg: Optional[List[float]] = None
 
         j = body_elem.find("joint")
         if j is not None and j.get("type", "hinge") == "hinge":
+            joint_name = j.get("name", f"{name}_joint")
             joint_axis = self._parse_vec(j.get("axis"), 3, default=0.0)
             r = self._parse_vec(j.get("range"), 2, default=0.0)
             if angle_unit == "radian":
@@ -467,6 +729,7 @@ class G1TemplateLoader:
             mass=float(max(mass, 1e-5)),
             com=com,
             inertia=inertia,
+            joint_name=joint_name,
             joint_axis=joint_axis,
             joint_range_deg=joint_range_deg,
             children=child_nodes,
@@ -521,6 +784,7 @@ class HumanoidBuilder:
         self._joint_profiles: Dict[str, Dict[str, Any]] = {}
         self._inertia_profiles: Dict[str, Tuple[float, List[float], List[float], List[float]]] = {}
         self._hip_group_profile: Optional[Dict[str, Dict[str, List[float]]]] = None
+        self.last_semantic_description: Optional[Dict[str, Any]] = None
 
         self.template_root = G1TemplateLoader(template_xml).load()
 
@@ -582,10 +846,15 @@ class HumanoidBuilder:
         s = np.clip(s, lo, hi)
         return s.tolist()
 
-    def _get_joint_profile(self, name: str, base_axis: Optional[List[float]]) -> Dict[str, Any]:
+    def _get_joint_profile(
+        self,
+        name: str,
+        joint_name: Optional[str],
+        base_axis: Optional[List[float]],
+    ) -> Dict[str, Any]:
         key = pair_key(name)
         if key not in self._joint_profiles:
-            b = base_name(name)
+            b = self.joint_rand._joint_base(name, joint_name=joint_name)
             hip_group = None
             if b in self.joint_rand.HIP_JOINTS:
                 if self._hip_group_profile is None:
@@ -594,6 +863,7 @@ class HumanoidBuilder:
 
             self._joint_profiles[key] = self.joint_rand.sample_joint_profile(
                 name=name,
+                joint_name=joint_name,
                 base_axis=base_axis,
                 hip_group=hip_group,
             )
@@ -610,6 +880,7 @@ class HumanoidBuilder:
         key = pair_key(name)
         if key not in self._inertia_profiles:
             self._inertia_profiles[key] = self.inertia_rand.randomize(
+                link_name=name,
                 base_mass=b_mass,
                 base_com=b_com,
                 base_inertia=b_inertia,
@@ -643,9 +914,11 @@ class HumanoidBuilder:
         )
         v_size = self._refine_visual_size(name, v_size)
 
-        profile = self._get_joint_profile(name, base_axis=None)
+        synthetic_joint_name = f"{name}_joint"
+        profile = self._get_joint_profile(name=name, joint_name=synthetic_joint_name, base_axis=None)
         jp = self.joint_rand.randomize_joint(
             name=name,
+            joint_name=synthetic_joint_name,
             base_pos=b_pos,
             base_range_deg=b_range,
             total_mass=self.ref_mass,
@@ -660,6 +933,7 @@ class HumanoidBuilder:
             com=com,
             inertia=inertia,
             v_size=v_size,
+            joint_name=synthetic_joint_name,
             joint_params=jp,
             euler=jp["euler"],
             children=children or [],
@@ -696,6 +970,7 @@ class HumanoidBuilder:
             com=com,
             inertia=inertia,
             v_size=v_size,
+            joint_name=None,
             joint_params={"type": "weld"},
             euler=[0.0, 0.0, 0.0],
             children=children or [],
@@ -717,11 +992,17 @@ class HumanoidBuilder:
             joint_params = {"type": "weld"}
             rel_pos = node.rel_pos
             euler = [0.0, 0.0, 0.0]
+            joint_name = node.joint_name
         elif node.joint_axis is not None and node.joint_range_deg is not None:
-            profile = self._get_joint_profile(node.name, base_axis=node.joint_axis)
+            profile = self._get_joint_profile(
+                name=node.name,
+                joint_name=node.joint_name,
+                base_axis=node.joint_axis,
+            )
             parent_com_dist = float(max(np.linalg.norm(node.rel_pos), 1e-3))
             jp = self.joint_rand.randomize_joint(
                 name=node.name,
+                joint_name=node.joint_name,
                 base_pos=node.rel_pos,
                 base_range_deg=node.joint_range_deg,
                 total_mass=self.ref_mass,
@@ -731,10 +1012,12 @@ class HumanoidBuilder:
             joint_params = jp
             rel_pos = jp["pos"]
             euler = jp["euler"]
+            joint_name = node.joint_name
         else:
             joint_params = {"type": "weld"}
             rel_pos = node.rel_pos
             euler = [0.0, 0.0, 0.0]
+            joint_name = node.joint_name
 
         built = LinkDef(
             name=node.name,
@@ -743,6 +1026,7 @@ class HumanoidBuilder:
             com=com,
             inertia=inertia,
             v_size=v_size,
+            joint_name=joint_name,
             joint_params=joint_params,
             euler=euler,
             children=[],
@@ -885,8 +1169,77 @@ class HumanoidBuilder:
                     f"Hip Euler offsets ({side}) do not preserve zero sum: {euler_sum.tolist()}"
                 )
 
+    def _collect_hinge_global_indices(self, root: LinkDef) -> List[int]:
+        indices: List[int] = []
+
+        def _walk(link: LinkDef):
+            idx = semantic_joint_index(link.name, link.joint_name)
+            if idx is not None and link.joint_params.get("type") == "hinge":
+                indices.append(idx)
+            for c in link.children:
+                _walk(c)
+
+        _walk(root)
+        return indices
+
+    def build_semantic_description(self, root: LinkDef) -> Dict[str, Any]:
+        present_mask = np.zeros((N_MAX_GLOBAL_JOINTS,), dtype=np.int32)
+        actuated_mask = np.zeros((N_MAX_GLOBAL_JOINTS,), dtype=np.int32)
+        adjacency = np.zeros((N_MAX_GLOBAL_JOINTS, N_MAX_GLOBAL_JOINTS), dtype=np.int32)
+        link_name_for_index = [""] * N_MAX_GLOBAL_JOINTS
+        joint_type_for_index = ["missing"] * N_MAX_GLOBAL_JOINTS
+        indegree = np.zeros((N_MAX_GLOBAL_JOINTS,), dtype=np.int32)
+
+        def _walk(link: LinkDef, parent_idx: Optional[int]):
+            idx = semantic_joint_index(link.name, link.joint_name)
+            next_parent = parent_idx
+
+            if idx is not None:
+                present_mask[idx] = 1
+                if not link_name_for_index[idx]:
+                    link_name_for_index[idx] = link.name
+                if link.joint_params.get("type") == "hinge":
+                    actuated_mask[idx] = 1
+                    joint_type_for_index[idx] = "hinge"
+                else:
+                    if joint_type_for_index[idx] == "missing":
+                        joint_type_for_index[idx] = "fixed"
+                if parent_idx is not None and parent_idx != idx and adjacency[parent_idx, idx] == 0:
+                    adjacency[parent_idx, idx] = 1
+                    indegree[idx] += 1
+                next_parent = idx
+
+            for c in link.children:
+                _walk(c, next_parent)
+
+        _walk(root, parent_idx=None)
+
+        roots = [i for i in range(N_MAX_GLOBAL_JOINTS) if present_mask[i] == 1 and indegree[i] == 0]
+        if len(roots) > 1:
+            anchor = 14 if 14 in roots else roots[0]  # waist_yaw if available
+            for r in roots:
+                if r == anchor:
+                    continue
+                if adjacency[anchor, r] == 0:
+                    adjacency[anchor, r] = 1
+
+        active_global_indices = self._collect_hinge_global_indices(root)
+        return {
+            "n_max": int(N_MAX_GLOBAL_JOINTS),
+            "global_joint_names": list(GLOBAL_JOINT_NAMES),
+            "global_joint_axes": GLOBAL_JOINT_AXES.astype(float).tolist(),
+            "joint_present_mask": present_mask.astype(int).tolist(),
+            "joint_actuated_mask": actuated_mask.astype(int).tolist(),
+            "joint_types": joint_type_for_index,
+            "joint_link_names": link_name_for_index,
+            "adjacency": adjacency.astype(int).tolist(),
+            "active_dofs": int(np.sum(actuated_mask)),
+            "active_global_indices_in_kinematic_order": [int(x) for x in active_global_indices],
+        }
+
     def build(self) -> LinkDef:
         self._reset_profiles()
+        self.last_semantic_description = None
 
         root = self._build_from_template(self.template_root, is_root=True)
         if self.add_head_joints:
@@ -895,6 +1248,12 @@ class HumanoidBuilder:
         total_mass = self._sum_mass(root)
         self._rescale_joint_torques(root, total_mass)
         self._assert_physical_consistency(root)
+
+        dofs = self.count_active_dofs(root)
+        if dofs < 12 or dofs > 32:
+            raise ValueError(f"Active DoF out of expected [12, 32] range: {dofs}")
+
+        self.last_semantic_description = self.build_semantic_description(root)
         return root
 
     def count_active_dofs(self, link: LinkDef) -> int:
@@ -1068,7 +1427,7 @@ class MuJoCoCompiler:
         if jtype == "free":
             ET.SubElement(body_xml, "freejoint", name=f"{link.name}_root")
         elif jtype == "hinge":
-            jname = f"{link.name}_j"
+            jname = link.joint_name if link.joint_name else f"{link.name}_j"
             jp = link.joint_params
             ET.SubElement(
                 body_xml,

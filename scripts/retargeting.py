@@ -1,3 +1,28 @@
+"""
+Retarget AMASS/SMPLH motion (.npz) to randomized humanoid robots using dynamic IK.
+
+Example usage (run from project root):
+
+  # Retarget a single motion to one randomized robot (defaults)
+  python scripts/retargeting.py --motion-npz data/ACCAD/Male2MartialArtsExtended_c3d/Extended_1_stageii.npz
+
+  # Retarget to 3 different randomized robots, 30 fps, with visualization
+  python scripts/retargeting.py --motion-npz data/ACCAD/Male2MartialArtsExtended_c3d/Extended_1_stageii.npz \
+      --num-robots 3 --target-fps 30 --visualize --rate-limit
+
+  # Only generate randomized robot XMLs and IK configs (no retargeting)
+  python scripts/retargeting.py --motion-npz data/ACCAD/Male2MartialArtsExtended_c3d/Extended_1_stageii.npz --generate-only
+
+  # Full example: custom paths, record video, fixed seed
+  python scripts/retargeting.py \
+      --motion-npz data/ACCAD/Male2MartialArtsExtended_c3d/Extended_1_stageii.npz \
+      --body-models-dir data \
+      --template-xml assets/g1_29dof/g1_29dof.xml \
+      --template-ik third_party/gmr/general_motion_retargeting/ik_configs/smplx_to_g1.json \
+      --output-dir outputs/retargeting \
+      --num-robots 1 --seed 42 --target-fps 30 \
+      --record-video --visualize --rate-limit
+"""
 from __future__ import annotations
 
 import argparse
@@ -604,7 +629,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=str(ROOT / "outputs" / "retargeting"))
     parser.add_argument("--num-robots", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--target-fps", type=float, default=30.0)
+    parser.add_argument("--target-fps", type=float, default=20.0)
     parser.add_argument("--disable-head-task", action="store_true", default=False)
     parser.add_argument("--disable-head-joints", action="store_true", default=False)
     parser.add_argument("--visualize", action="store_true", default=False)

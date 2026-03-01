@@ -628,7 +628,7 @@ def main() -> None:
     human_height = 1.8
 
     if not args.generate_only:
-        print("[1/3] Cargando motion humano y reconstruyendo joints/orientaciones SMPLH...")
+        print("[1/3] Loading human motion and reconstructing SMPLH joints/orientations...")
         human_frames, aligned_fps, human_height = load_human_motion_frames(
             npz_path=motion_npz,
             body_models_dir=body_models_dir,
@@ -636,7 +636,7 @@ def main() -> None:
         )
         print(f"      Frames: {len(human_frames)} | FPS alineado: {aligned_fps:.3f} | altura estimada: {human_height:.3f} m")
 
-    print("[2/3] Generando robots randomizados + IK configs dinámicos...")
+    print("[2/3] Generating randomized robots + dynamic IK configs...")
     for idx in range(int(args.num_robots)):
         robot_seed = int(args.seed) + idx
         robot_key = f"random_humanoid_{int(time.time())}_{idx}"
@@ -666,7 +666,7 @@ def main() -> None:
         if args.generate_only:
             continue
 
-        print(f"[3/3] Retargeting robot_{idx:03d}...")
+        print(f"[3/3] Retargeting robot_{idx:03d} motion...")
         retarget_motion(
             robot_key=robot_key,
             robot_xml_path=robot_xml_path,
@@ -680,9 +680,9 @@ def main() -> None:
             record_video=bool(args.record_video),
             video_path=video_path if args.record_video else None,
         )
-        print(f"      Motion guardado en: {retargeted_motion_path}")
+        print(f"      Motion saved in: {retargeted_motion_path}")
 
-    print(f"Hecho. Salidas en: {output_dir}")
+    print(f"Done. Outputs in: {output_dir}")
 
 
 if __name__ == "__main__":

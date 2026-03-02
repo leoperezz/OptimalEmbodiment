@@ -1,23 +1,61 @@
+"""Full evaluation pipeline: human motion → random robots → retargeting → scoring → grid visualization.
+
+Usage examples (run from project root):
+
+  # Minimal run: 4 robots, default assets
+  python scripts/evaluation.py --motion-npz data/ACCAD/Male2MartialArtsExtended_c3d/Extended_1_stageii.npz
+
+  # Custom number of robots with visualization
+  python scripts/evaluation.py \
+      --motion-npz data/ACCAD/Male2MartialArtsExtended_c3d/Extended_1_stageii.npz \
+      --num-robots 6 --visualize-grid
+
+  # Grid view with wider spacing and phase-stagger so every robot shows a different pose
+  python scripts/evaluation.py \
+      --motion-npz data/ACCAD/Male2MartialArtsExtended_c3d/Extended_1_stageii.npz \
+      --num-robots 9 --visualize-grid --grid-spacing 3.0 --grid-phase-offset 0.5 --grid-loop
+
+  # Re-use already generated robots (skip retargeting) and jump straight to the grid
+  python scripts/evaluation.py \
+      --motion-npz data/ACCAD/Male2MartialArtsExtended_c3d/Extended_1_stageii.npz \
+      --num-robots 4 --keep-existing --visualize-grid
+
+  # Only show ranked single-robot visualizations (legacy mode)
+  python scripts/evaluation.py \
+      --motion-npz data/ACCAD/Male2MartialArtsExtended_c3d/Extended_1_stageii.npz \
+      --visualize-ranked --visualize-top-k 3 --visualize-worst-k 1
+
+"""
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import pickle
 import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-ROOT = Path(__file__).resolve().parents[2]
+import mujoco
+import mujoco.viewer as mjv
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts import retargeting as rt  # noqa: E402
+import retargeting as rt  # noqa: E402
 
 from optimal_embodiment.eval import robot2human as r2h  # noqa: E402
 from optimal_embodiment.smpl import  load_human_motion_frames
 from optimal_embodiment.robot.utils import build_random_robot_xml, generate_ik_config
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _parse_seed_list(seed_list: Optional[str]) -> Optional[List[int]]:
     if seed_list is None:
@@ -80,11 +118,227 @@ def _save_per_robot_score(robot_dir: Path, seed: int, result: r2h.RobotEval) -> 
         json.dump(payload, f, indent=2)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Grid visualization
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _grid_positions(n: int, spacing: float) -> List[Tuple[float, float]]:
+    """Return centered XY positions for n robots arranged in the tightest square grid."""
+    cols = max(1, math.ceil(math.sqrt(n)))
+    rows = math.ceil(n / cols)
+    positions: List[Tuple[float, float]] = []
+    x_offset = (cols - 1) * spacing / 2.0
+    y_offset = (rows - 1) * spacing / 2.0
+    for i in range(n):
+        row = i // cols
+        col = i % cols
+        positions.append((col * spacing - x_offset, row * spacing - y_offset))
+    return positions
+
+
+def _load_motion_pkl(pkl_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Load a retargeted motion PKL and return (root_pos, root_rot_wxyz, dof_pos, fps)."""
+    with open(pkl_path, "rb") as f:
+        data = pickle.load(f)
+    fps: float = float(data["fps"])
+    root_pos: np.ndarray = np.asarray(data["root_pos"], dtype=np.float64)     # (T, 3)
+    root_rot_xyzw: np.ndarray = np.asarray(data["root_rot"], dtype=np.float64) # (T, 4) xyzw
+    dof_pos: np.ndarray = np.asarray(data["dof_pos"], dtype=np.float64)         # (T, N)
+    # MuJoCo qpos stores quaternion as wxyz; PKL stores xyzw
+    root_rot_wxyz = np.concatenate([root_rot_xyzw[:, 3:4], root_rot_xyzw[:, :3]], axis=-1)
+    return root_pos, root_rot_wxyz, dof_pos, fps
+
+
+def _build_combined_grid_model(
+    robot_xml_paths: List[Path],
+    positions: List[Tuple[float, float]],
+) -> Tuple[mujoco.MjModel, List[int]]:
+    """Merge all robots into one MuJoCo scene arranged at the given XY positions.
+
+    Returns (combined_model, free_qpos_adrs) where free_qpos_adrs[i] is the
+    qpos address of robot i's free joint in the merged model.
+    """
+    spec = mujoco.MjSpec()
+
+    # Ground plane (scene floor) with checkerboard texture
+    tex = spec.add_texture()
+    tex.name = "texplane"
+    tex.type = mujoco.mjtTexture.mjTEXTURE_2D
+    tex.builtin = mujoco.mjtBuiltin.mjBUILTIN_CHECKER
+    tex.rgb1 = [0.2, 0.3, 0.4]
+    tex.rgb2 = [0.1, 0.2, 0.3]
+    tex.width = 512
+    tex.height = 512
+
+    mat = spec.add_material()
+    mat.name = "matplane"
+    mat.textures = ["texplane"] + [""] * 9  # exactly 10 slots; empty for unused
+    mat.texrepeat = [4.0, 4.0]
+    mat.texuniform = True
+
+    floor = spec.worldbody.add_geom()
+    floor.name = "grid_floor"
+    floor.type = mujoco.mjtGeom.mjGEOM_PLANE
+    floor.size = [0.0, 0.0, 0.05]
+    floor.material = "matplane"
+
+    # Attach each robot with a unique prefix and a frame at TQits grid position
+    for i, (xml_path, (gx, gy)) in enumerate(zip(robot_xml_paths, positions)):
+        child = mujoco.MjSpec.from_file(str(xml_path))
+        frame = spec.worldbody.add_frame()
+        frame.pos = [gx, gy, 0.0]
+        spec.attach(child, prefix=f"r{i}_", suffix="", frame=frame)
+
+    model = spec.compile()
+
+    # Collect the qposadr for each robot's free joint (type 0 = mjJNT_FREE)
+    free_qpos_adrs: List[int] = []
+    for i in range(len(robot_xml_paths)):
+        prefix = f"r{i}_"
+        adr = -1
+        for j in range(model.njnt):
+            if model.jnt_type[j] != 0:
+                continue
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+            if name and name.startswith(prefix):
+                adr = int(model.jnt_qposadr[j])
+                break
+        if adr == -1:
+            raise RuntimeError(
+                f"Could not find free joint for robot {i} (prefix={prefix!r}). "
+                "Make sure the robot XML has a floating-base free joint."
+            )
+        free_qpos_adrs.append(adr)
+
+    return model, free_qpos_adrs
+
+
+def visualize_robots_grid(
+    robot_dirs: List[Path],
+    motion_stem: str,
+    spacing: float = 2.5,
+    phase_offset: float = 0.5,
+    loop: bool = False,
+    cam_distance: float = 8.0,
+    cam_elevation: float = -15.0,
+) -> None:
+    """Display all robots simultaneously in a single MuJoCo environment.
+
+    Robots are arranged in a square grid, each playing the retargeted motion
+    at a different phase so they appear to perform diverse movements at any
+    given instant.
+
+    Parameters
+    ----------
+    robot_dirs:    Directories that each contain robot.xml and <motion_stem>.pkl.
+    motion_stem:   Stem of the PKL file (e.g. 'Extended_1_stageii').
+    spacing:       Distance in metres between adjacent robots in the grid.
+    phase_offset:  Fraction of total frames to stagger consecutive robots
+                   (0.0 = all in sync, 0.5 = half-cycle apart).
+    loop:          Whether to loop the animation indefinitely.
+    cam_distance:  Passive viewer camera distance.
+    cam_elevation: Passive viewer camera elevation in degrees.
+    """
+    n = len(robot_dirs)
+    if n == 0:
+        print("      [grid] No robot directories provided — skipping.")
+        return
+
+    print(f"\n[Grid] Building combined scene for {n} robot(s) | spacing={spacing}m")
+
+    xml_paths = [d / "robot.xml" for d in robot_dirs]
+    pkl_paths = [d / f"{motion_stem}.pkl" for d in robot_dirs]
+
+    for p in xml_paths + pkl_paths:
+        if not p.is_file():
+            raise FileNotFoundError(f"[Grid] Required file not found: {p}")
+
+    positions = _grid_positions(n, spacing)
+    model, free_qpos_adrs = _build_combined_grid_model(xml_paths, positions)
+    data = mujoco.MjData(model)
+
+    # Load all motions
+    motions: List[Tuple[np.ndarray, np.ndarray, np.ndarray, float]] = []
+    for pkl in pkl_paths:
+        motions.append(_load_motion_pkl(pkl))
+
+    fps = motions[0][3]
+    T = motions[0][0].shape[0]
+
+    # Phase offsets: robot i starts at frame (i * phase_frames) % T
+    phase_frames = [round(i * phase_offset * T) % T for i in range(n)]
+    print(f"[Grid] T={T} frames | fps={fps:.1f} | phase offsets={phase_frames}")
+    print(f"[Grid] Grid layout: {[f'({p[0]:.1f},{p[1]:.1f})' for p in positions]}")
+    print("[Grid] Press Esc or close the window to stop.")
+
+    viewer = mjv.launch_passive(model=model, data=data, show_left_ui=False, show_right_ui=False)
+
+    viewer.cam.lookat[:] = [0.0, 0.0, 0.9]
+    viewer.cam.distance = cam_distance
+    viewer.cam.elevation = cam_elevation
+    viewer.cam.azimuth = 45.0
+
+    # Pre-compute the full qpos buffer for every frame so the render loop only
+    # does a single numpy copy + mj_kinematics per frame.
+    print("[Grid] Pre-computing qpos buffer…", end=" ", flush=True)
+    nq = model.nq
+    all_frames = np.arange(T)
+    qpos_buf = np.empty((T, nq), dtype=np.float64)
+    qpos_buf[:] = data.qpos[np.newaxis, :]
+
+    for i, (root_pos, root_rot_wxyz, dof_pos, _) in enumerate(motions):
+        adr = free_qpos_adrs[i]
+        gx, gy = positions[i]
+        pos0 = root_pos[0]
+        frame_indices = (all_frames + phase_frames[i]) % T
+
+        rp = root_pos[frame_indices]
+        qpos_buf[:, adr]     = gx + (rp[:, 0] - pos0[0])
+        qpos_buf[:, adr + 1] = gy + (rp[:, 1] - pos0[1])
+        qpos_buf[:, adr + 2] = rp[:, 2]
+        qpos_buf[:, adr + 3:adr + 7] = root_rot_wxyz[frame_indices]
+
+        n_dof = min(dof_pos.shape[1], nq - adr - 7)
+        qpos_buf[:, adr + 7:adr + 7 + n_dof] = dof_pos[frame_indices, :n_dof]
+
+    print("done.")
+
+    mujoco.mj_kinematics(model, data)
+
+    # Drive playback from wall-clock time so the animation always stays in sync
+    # with real time. If a frame renders slowly we skip ahead to the correct
+    # position instead of falling behind, which is what caused the lag.
+    duration = T / fps
+    start_wall = time.perf_counter()
+
+    try:
+        while viewer.is_running():
+            elapsed = time.perf_counter() - start_wall
+
+            if not loop and elapsed >= duration:
+                break
+
+            t = int((elapsed % duration) * fps)
+            t = min(t, T - 1)
+
+            data.qpos[:] = qpos_buf[t]
+            mujoco.mj_kinematics(model, data)
+            viewer.sync()
+
+    finally:
+        viewer.close()
+        time.sleep(0.3)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Argument parsing
+# ──────────────────────────────────────────────────────────────────────────────
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Full pipeline: human npz -> random robots -> retargeting -> scoring -> "
-            "visualization ordered by score."
+            "grid visualization in MuJoCo."
         )
     )
     parser.add_argument("--motion-npz", type=str, required=True, help="Human motion .npz (AMASS/SMPLH).")
@@ -126,12 +380,12 @@ def parse_args() -> argparse.Namespace:
         help="Name of pkl without extension (default: npz stem).",
     )
     parser.add_argument("--seed", type=int, default=0, help="Base seed (if not using --robot-seeds).")
-    parser.add_argument("--num-robots", type=int, default=4, help="Number of robots (if not using --robot-seeds).")
+    parser.add_argument("--num-robots", type=int, default=4, help="Number of robots to generate and evaluate.")
     parser.add_argument(
         "--robot-seeds",
         type=str,
         default=None,
-        help="Comma-separated list of seeds. Example: 1,7,42,105",
+        help="Comma-separated list of seeds instead of --num-robots. Example: 1,7,42,105",
     )
     parser.add_argument("--target-fps", type=float, default=30.0)
     parser.add_argument("--disable-head-task", action="store_true", default=False)
@@ -144,24 +398,70 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="If robot.xml/IK/PKL already exists for a robot, do not regenerate.",
     )
+
+    # ── legacy per-robot visualization ──────────────────────────────────────
     parser.add_argument(
         "--visualize-ranked",
         action="store_true",
         default=False,
-        help="At the end, play back ranked robots showing original human + robot.",
+        help="Play back ranked robots one by one (original human + robot, sequential windows).",
     )
-    parser.add_argument("--visualize-top-k", type=int, default=3, help="Top-K to visualize.")
-    parser.add_argument("--visualize-worst-k", type=int, default=1, help="Worst-K to visualize.")
+    parser.add_argument("--visualize-top-k", type=int, default=3, help="Top-K to visualize (--visualize-ranked).")
+    parser.add_argument("--visualize-worst-k", type=int, default=1, help="Worst-K to visualize (--visualize-ranked).")
     parser.add_argument(
         "--no-rate-limit",
         action="store_true",
         default=False,
-        help="If set, do not respect real fps in final visualization.",
+        help="Skip real-time FPS throttle in legacy per-robot visualization.",
     )
-    parser.add_argument("--record-video", action="store_true", default=False, help="Record mp4 in final visualization.")
     parser.add_argument("--summary-json", type=str, default=None, help="Path of final JSON summary.")
+
+    # ── grid visualization ───────────────────────────────────────────────────
+    parser.add_argument(
+        "--visualize-grid",
+        action="store_true",
+        default=False,
+        help="After the pipeline, show ALL robots together in one MuJoCo scene arranged in a grid.",
+    )
+    parser.add_argument(
+        "--grid-spacing",
+        type=float,
+        default=2.5,
+        help="Distance in metres between adjacent robots in the grid (default: 2.5).",
+    )
+    parser.add_argument(
+        "--grid-phase-offset",
+        type=float,
+        default=0.5,
+        help=(
+            "Fraction of the total motion to stagger each consecutive robot's playback "
+            "(0 = all in sync, 0.5 = half-cycle apart). Default: 0.5."
+        ),
+    )
+    parser.add_argument(
+        "--grid-loop",
+        action="store_true",
+        default=False,
+        help="Loop the grid animation indefinitely (default: play once and exit).",
+    )
+    parser.add_argument(
+        "--grid-cam-distance",
+        type=float,
+        default=8.0,
+        help="Camera distance for the grid viewer (default: 8.0).",
+    )
+    parser.add_argument(
+        "--grid-cam-elevation",
+        type=float,
+        default=-15.0,
+        help="Camera elevation for the grid viewer in degrees (default: -15).",
+    )
     return parser.parse_args()
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     args = parse_args()
@@ -324,7 +624,22 @@ def main() -> None:
         json.dump(payload, f, indent=2)
     print(f"      -> {summary_json}")
 
-    print("[5/5] Comparative visualization")
+    print("[5/5] Visualization")
+
+    # ── Grid: all robots in one shared MuJoCo environment ───────────────────
+    if args.visualize_grid:
+        successful_dirs = [Path(res.robot_dir) for _, res in ranked]
+        visualize_robots_grid(
+            robot_dirs=successful_dirs,
+            motion_stem=motion_stem,
+            spacing=float(args.grid_spacing),
+            phase_offset=float(args.grid_phase_offset),
+            loop=bool(args.grid_loop),
+            cam_distance=float(args.grid_cam_distance),
+            cam_elevation=float(args.grid_cam_elevation),
+        )
+
+    # ── Legacy: ranked single-robot playback ────────────────────────────────
     if args.visualize_ranked:
         to_visualize = _robot_dirs_with_scores(
             results=ranked,
@@ -349,10 +664,6 @@ def main() -> None:
                     f"\n      [{vis_idx}/{len(to_visualize)}] {robot_dir.name} (seed={seed}) | "
                     f"overall={_fmt(res.overall_score, 2)} | mpjpe={_fmt(res.mpjpe_cm, 2)}cm"
                 )
-                print(
-                    f"      label: rank={vis_idx}, score={_fmt(res.overall_score, 2)}, "
-                    f"imit={_fmt(res.imitation_score, 2)}, quality={_fmt(res.quality_score, 2)}"
-                )
                 robot_key = f"viz_robot_{vis_idx}_{int(time.time())}"
                 rt.retarget_motion(
                     robot_key=robot_key,
@@ -364,11 +675,12 @@ def main() -> None:
                     save_path=pkl_path,
                     visualize=True,
                     rate_limit=not bool(args.no_rate_limit),
-                    record_video=bool(args.record_video),
-                    video_path=video_path if bool(args.record_video) else None,
+                    record_video=False,
+                    video_path=None,
                 )
-    else:
-        print("      skipped (use --visualize-ranked to enable)")
+
+    if not args.visualize_grid and not args.visualize_ranked:
+        print("      skipped (use --visualize-grid or --visualize-ranked to enable)")
 
     print("\nDone.")
 

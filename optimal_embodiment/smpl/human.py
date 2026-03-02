@@ -1,8 +1,10 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import torch
 import numpy as np
 
 from optimal_embodiment.constants import SMPLH_PRIMARY_JOINTS

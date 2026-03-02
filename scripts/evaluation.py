@@ -15,6 +15,8 @@ if str(ROOT) not in sys.path:
 from scripts import retargeting as rt  # noqa: E402
 
 from optimal_embodiment.eval import robot2human as r2h  # noqa: E402
+from optimal_embodiment.smpl import  load_human_motion_frames
+from optimal_embodiment.robot.utils import build_random_robot_xml, generate_ik_config
 
 
 def _parse_seed_list(seed_list: Optional[str]) -> Optional[List[int]]:
@@ -183,7 +185,7 @@ def main() -> None:
     print(f"Selected seeds ({len(seeds)}): {seeds}")
 
     print("[1/5] Loading human motion...")
-    human_frames, aligned_fps, human_height = rt.load_human_motion_frames(
+    human_frames, aligned_fps, human_height = load_human_motion_frames(
         npz_path=motion_npz,
         body_models_dir=body_models_dir,
         target_fps=float(args.target_fps),
@@ -211,13 +213,13 @@ def main() -> None:
         try:
             generate_needed = not bool(args.keep_existing and xml_path.is_file() and ik_path.is_file())
             if generate_needed:
-                model = rt.build_random_robot_xml(
+                model = build_random_robot_xml(
                     output_xml_path=xml_path,
                     template_xml=template_xml,
                     seed=int(seed),
                     add_head_joints=not bool(args.disable_head_joints),
                 )
-                ik_cfg = rt.generate_ik_config(
+                ik_cfg = generate_ik_config(
                     model=model,
                     output_path=ik_path,
                     template_ik_path=template_ik,

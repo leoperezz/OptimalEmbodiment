@@ -26,6 +26,8 @@ import mujoco
 import mujoco.viewer as mjv
 import numpy as np
 
+from optimal_embodiment.constants import BASE_BODY_CANDIDATES
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -33,16 +35,6 @@ if str(ROOT) not in sys.path:
 # ──────────────────────────────────────────────────────────────────────────────
 # Body-name candidates used to pick the camera look-at target.
 # ──────────────────────────────────────────────────────────────────────────────
-_BASE_BODY_CANDIDATES = [
-    "pelvis",
-    "base_link",
-    "base",
-    "Waist",
-    "waist_link",
-    "trunk",
-    "Trunk",
-    "torso",
-]
 
 
 class RobotMotionViewer:
@@ -91,7 +83,7 @@ class RobotMotionViewer:
 
     # ------------------------------------------------------------------
     def _find_base_body(self) -> int:
-        for name in _BASE_BODY_CANDIDATES:
+        for name in BASE_BODY_CANDIDATES:
             try:
                 return self.model.body(name).id
             except (KeyError, mujoco.FatalError):

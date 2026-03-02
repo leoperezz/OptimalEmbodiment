@@ -1,3 +1,12 @@
+"""
+Robot-to-human motion evaluation script.
+
+Evaluates imitation fidelity between human motion (.npz) and retargeted robot motion (.pkl).
+Pipeline: load human/robot data -> pelvis-centering -> Procrustes (scale + rotation) ->
+imitation metrics (MPJPE, PCK@10cm, velocity error, root RMSE, optional DTW) ->
+quality metrics (joint limits, DOF acceleration, foot slip) -> composite scores (imitation,
+quality, overall). See docs/evaluation.md for full metric definitions and formulas.
+"""
 from __future__ import annotations
 
 import argparse
@@ -20,6 +29,8 @@ if str(ROOT) not in sys.path:
 from scripts import retargeting as rt  # noqa: E402
 
 
+# --- Joint ordering and robot body mapping (input data convention) ---
+# Fixed order for human/robot joint positions; only joints present in both are used for metrics.
 JOINT_ORDER: List[str] = [
     "pelvis",
     "left_hip",
@@ -38,7 +49,7 @@ JOINT_ORDER: List[str] = [
     "right_wrist",
 ]
 
-
+# Maps each logical joint name to the robot model body/link name used for 3D position lookup.
 JOINT_TO_TEMPLATE_FRAME: Dict[str, str] = {
     "pelvis": "pelvis",
     "left_hip": "left_hip_roll_link",
@@ -58,6 +69,7 @@ JOINT_TO_TEMPLATE_FRAME: Dict[str, str] = {
 }
 
 
+# --- Evaluation result (all metrics and composite scores 0--100) ---
 @dataclass
 class RobotEval:
     robot_dir: str
@@ -81,16 +93,18 @@ class RobotEval:
     overall_score: float
 
 
+# --- Loading and I/O ---
 def _load_robot_motion(pkl_path: Path) -> Dict[str, np.ndarray | float]:
+    """Load robot motion from .pkl: root_pos, root_rot (xyzw), dof_pos, fps; validate shapes."""
     with open(pkl_path, "rb") as f:
         data = pickle.load(f)
     if not isinstance(data, dict):
-        raise ValueError(f"Formato inesperado en {pkl_path}: se esperaba dict.")
+        raise ValueError(f"Unexpected format in {pkl_path}: expected dict.")
 
     required = ["root_pos", "root_rot", "dof_pos"]
     for key in required:
         if key not in data:
-            raise KeyError(f"Falta '{key}' en {pkl_path}.")
+            raise KeyError(f"Missing '{key}' in {pkl_path}.")
 
     root_pos = np.asarray(data["root_pos"], dtype=np.float64)
     root_rot_xyzw = np.asarray(data["root_rot"], dtype=np.float64)
@@ -98,14 +112,14 @@ def _load_robot_motion(pkl_path: Path) -> Dict[str, np.ndarray | float]:
     fps = float(data.get("fps", 30.0))
 
     if root_pos.ndim != 2 or root_pos.shape[1] != 3:
-        raise ValueError(f"root_pos inválido en {pkl_path}: {root_pos.shape}")
+        raise ValueError(f"Invalid root_pos in {pkl_path}: {root_pos.shape}")
     if root_rot_xyzw.ndim != 2 or root_rot_xyzw.shape[1] != 4:
-        raise ValueError(f"root_rot inválido en {pkl_path}: {root_rot_xyzw.shape}")
+        raise ValueError(f"Invalid root_rot in {pkl_path}: {root_rot_xyzw.shape}")
     if dof_pos.ndim != 2:
-        raise ValueError(f"dof_pos inválido en {pkl_path}: {dof_pos.shape}")
+        raise ValueError(f"Invalid dof_pos in {pkl_path}: {dof_pos.shape}")
     if not (root_pos.shape[0] == root_rot_xyzw.shape[0] == dof_pos.shape[0]):
         raise ValueError(
-            f"Cantidad de frames inconsistente en {pkl_path}: "
+            f"Inconsistent number of frames in {pkl_path}: "
             f"root_pos={root_pos.shape[0]}, root_rot={root_rot_xyzw.shape[0]}, dof_pos={dof_pos.shape[0]}"
         )
 
@@ -118,15 +132,16 @@ def _load_robot_motion(pkl_path: Path) -> Dict[str, np.ndarray | float]:
 
 
 def _find_motion_pkl(robot_dir: Path, motion_stem: Optional[str]) -> Path:
+    """Resolve path to motion .pkl in robot_dir (by stem or single .pkl)."""
     if motion_stem:
         p = robot_dir / f"{motion_stem}.pkl"
         if not p.is_file():
-            raise FileNotFoundError(f"No existe motion pkl esperado: {p}")
+            raise FileNotFoundError(f"No expected motion pkl exists: {p}")
         return p
 
     pkls = sorted(robot_dir.glob("*.pkl"))
     if not pkls:
-        raise FileNotFoundError(f"No se encontró ningún .pkl en {robot_dir}")
+        raise FileNotFoundError(f"No .pkl found in {robot_dir}")
     if len(pkls) > 1:
         raise RuntimeError(
             f"Hay múltiples .pkl en {robot_dir}. Usa --motion-stem para indicar uno específico."
@@ -134,30 +149,36 @@ def _find_motion_pkl(robot_dir: Path, motion_stem: Optional[str]) -> Path:
     return pkls[0]
 
 
-def _collect_robot_dirs(robot_dir: Optional[Path], retargeting_dir: Optional[Path]) -> List[Path]:
+def _collect_robot_dirs(
+    robot_dir: Optional[Path], retargeting_dir: Optional[Path]
+) -> List[Path]:
+    """Return list of robot dirs: either [robot_dir] or all robot_* subdirs of retargeting_dir."""
     if robot_dir is not None:
         if not robot_dir.is_dir():
-            raise FileNotFoundError(f"No existe robot_dir: {robot_dir}")
+            raise FileNotFoundError(f"No robot_dir exists: {robot_dir}")
         return [robot_dir]
 
     if retargeting_dir is None or not retargeting_dir.is_dir():
-        raise FileNotFoundError(f"No existe retargeting_dir: {retargeting_dir}")
+        raise FileNotFoundError(f"No retargeting_dir exists: {retargeting_dir}")
 
     dirs = sorted([p for p in retargeting_dir.iterdir() if p.is_dir() and p.name.startswith("robot_")])
     if not dirs:
         if (retargeting_dir / "robot.xml").is_file():
             return [retargeting_dir]
-        raise RuntimeError(f"No se encontraron carpetas robot_* en {retargeting_dir}")
+        raise RuntimeError(f"No robot_* folders found in {retargeting_dir}")
     return dirs
 
 
+# --- Preprocessing: human and robot pose extraction ---
 def _resolve_body_name(model: mujoco.MjModel, template_frame: str) -> Optional[str]:
+    """Map logical joint/template name to MuJoCo body name for this model."""
     body_names = rt._body_names_from_model(model)  # type: ignore[attr-defined]
     if template_frame == "head":
         return rt._resolve_head_body(body_names)  # type: ignore[attr-defined]
     return rt._resolve_frame_name(template_frame, body_names)  # type: ignore[attr-defined]
 
 
+# Human: build (T, J, 3) array of 3D joint positions from loaded frames; only joints in JOINT_ORDER.
 def _extract_human_positions(
     human_frames: List[Dict[str, Tuple[np.ndarray, np.ndarray]]],
     num_frames: int,
@@ -171,6 +192,7 @@ def _extract_human_positions(
     return arr
 
 
+# Robot: from root_pos, root_rot, dof_pos run MuJoCo forward and extract body positions (P^r).
 def _reconstruct_robot_tracks(
     model: mujoco.MjModel,
     motion: Dict[str, np.ndarray | float],
@@ -216,6 +238,9 @@ def _reconstruct_robot_tracks(
     return joint_tracks, qpos_full, resolved_names, body_ids
 
 
+# --- Procrustes alignment (scale + rotation) ---
+# Finds scale s and rotation R so that s*R*robot best fits human in least-squares sense.
+# Scale: s = sum(src*tgt)/sum(src*src); rotation: orthogonal Procrustes via SVD of H = (s*src)^T*tgt.
 def _scalar_procrustes_fit(src: np.ndarray, tgt: np.ndarray) -> Tuple[float, np.ndarray]:
     src_flat = src.reshape(-1, 3)
     tgt_flat = tgt.reshape(-1, 3)
@@ -237,6 +262,8 @@ def _scalar_procrustes_fit(src: np.ndarray, tgt: np.ndarray) -> Tuple[float, np.
     return scale, rot
 
 
+# --- Imitation metrics ---
+# DTW pose: sequence-level pose similarity allowing temporal shifts; cost = norm(h-r)/sqrt(|J|), result in m.
 def _dtw_pose_error_m(human_pose: np.ndarray, robot_pose: np.ndarray, max_frames: int) -> float:
     if human_pose.shape[0] == 0 or robot_pose.shape[0] == 0:
         return float("nan")
@@ -266,6 +293,8 @@ def _dtw_pose_error_m(human_pose: np.ndarray, robot_pose: np.ndarray, max_frames
     return float(prev[m] / (n + m))
 
 
+# --- Quality metrics (robot only) ---
+# Fraction of qpos values (over time) that fall outside joint limits [lo, hi]; 0 = no violations.
 def _joint_limit_violation_rate(model: mujoco.MjModel, qpos_full: np.ndarray) -> float:
     violations = 0
     total = 0
@@ -287,6 +316,7 @@ def _joint_limit_violation_rate(model: mujoco.MjModel, qpos_full: np.ndarray) ->
     return float(violations / total)
 
 
+# Mean L2 norm of joint acceleration (second derivative of dof_pos); reflects motion smoothness.
 def _dof_acc_mean(dof_pos: np.ndarray, fps: float) -> float:
     if dof_pos.shape[0] < 3:
         return float("nan")
@@ -297,6 +327,7 @@ def _dof_acc_mean(dof_pos: np.ndarray, fps: float) -> float:
     return float(np.mean(np.linalg.norm(acc, axis=1)))
 
 
+# Horizontal (xy) speed of feet during stance (z <= ground + 3cm); averaged over both feet, in cm/s.
 def _foot_slip_cm_s(robot_tracks: np.ndarray, fps: float) -> float:
     if robot_tracks.shape[0] < 2:
         return float("nan")
@@ -318,12 +349,17 @@ def _foot_slip_cm_s(robot_tracks: np.ndarray, fps: float) -> float:
     return float(np.mean(slips))
 
 
+# --- Composite scores ---
+# Maps "lower is better" metric to [0,1] score: exp(-value/scale); NaN/inf -> 0.
 def _safe_exp_score(value: float, scale: float) -> float:
     if not np.isfinite(value):
         return 0.0
     return float(np.exp(-value / max(scale, 1e-8)))
 
 
+# Imitation: 45% MPJPE, 20% PCK@10, 20% vel_error, 15% root_rmse; if DTW enabled, 85% base + 15% DTW.
+# Quality: 100 * exp(-80*joint_limit_viol) * safe_exp(foot_slip, 30) * safe_exp(dof_acc, 300).
+# Overall: 0.8*imitation + 0.2*quality; all clipped to [0, 100].
 def _compute_scores(
     mpjpe_cm: float,
     pck_10cm: float,
@@ -361,6 +397,11 @@ def _compute_scores(
     return imitation_score, quality_score, overall_score
 
 
+# --- Full evaluation pipeline ---
+# 1) Load human frames and robot motion; 2) extract human/robot positions; 3) valid joints only;
+# 4) pelvis-centering (C = P - P_pelvis); 5) Procrustes -> robot_aligned; 6) imitation metrics
+# (MPJPE, PCK@10, velocity error, root trajectory RMSE, optional DTW); 7) quality metrics;
+# 8) composite scores.
 def evaluate_robot(
     motion_npz: Path,
     body_models_dir: Path,
@@ -372,7 +413,7 @@ def evaluate_robot(
 ) -> RobotEval:
     xml_path = robot_dir / "robot.xml"
     if not xml_path.is_file():
-        raise FileNotFoundError(f"No existe robot.xml en {robot_dir}")
+        raise FileNotFoundError(f"No robot.xml exists in {robot_dir}")
 
     motion_pkl = _find_motion_pkl(robot_dir, motion_stem)
     motion = _load_robot_motion(motion_pkl)
@@ -392,7 +433,7 @@ def evaluate_robot(
 
     T = min(len(human_frames), robot_tracks.shape[0])
     if T <= 0:
-        raise RuntimeError(f"Sin frames comparables en {robot_dir}")
+        raise RuntimeError(f"No comparable frames in {robot_dir}")
 
     human_tracks = _extract_human_positions(human_frames=human_frames, num_frames=T)
     robot_tracks = robot_tracks[:T]
@@ -403,23 +444,27 @@ def evaluate_robot(
     valid_joint_ids = np.where(valid_joint_mask)[0]
     if valid_joint_ids.size < 5:
         raise RuntimeError(
-            f"Solo {valid_joint_ids.size} joints válidos en {robot_dir}. "
-            f"Revisa mapeo IK/body names de ese robot."
+            f"Only {valid_joint_ids.size} valid joints in {robot_dir}. "
+            f"Review IK/body names mapping for that robot."
         )
 
     human_valid = human_tracks[:, valid_joint_ids, :]
     robot_valid = robot_tracks[:, valid_joint_ids, :]
 
+    # Pelvis centering: subtract pelvis position so comparison is pose-only (no global translation).
     human_center = human_valid - human_valid[:, :1, :]
     robot_center = robot_valid - robot_valid[:, :1, :]
 
+    # Procrustes: scale and rotation to align robot to human; then aligned poses for imitation metrics.
     scale, rot = _scalar_procrustes_fit(src=robot_center, tgt=human_center)
     robot_aligned = np.einsum("tjd,dk->tjk", robot_center * scale, rot)
 
+    # MPJPE (cm): mean per-joint position error; PCK@10: fraction of joints within 10 cm.
     per_joint_err_m = np.linalg.norm(human_center - robot_aligned, axis=-1)
     mpjpe_cm = float(np.mean(per_joint_err_m) * 100.0)
     pck_10cm = float(np.mean(per_joint_err_m < 0.10) * 100.0)
 
+    # Velocity error (cm/s): L2 difference of joint velocities between human and aligned robot.
     if T > 1:
         dt = 1.0 / max(fps, 1e-8)
         v_h = np.diff(human_center, axis=0) / dt
@@ -428,16 +473,19 @@ def evaluate_robot(
     else:
         vel_error_cm_s = float("nan")
 
+    # Root trajectory RMSE (cm): pelvis path relative to first frame; robot path scaled/rotated to human.
     h_root = human_tracks[:, 0, :] - human_tracks[0:1, 0, :]
     r_root = robot_tracks[:, 0, :] - robot_tracks[0:1, 0, :]
     r_root_aligned = np.einsum("td,dk->tk", r_root * scale, rot)
     root_traj_rmse_cm = float(np.sqrt(np.mean(np.sum((h_root - r_root_aligned) ** 2, axis=-1))) * 100.0)
 
+    # Optional DTW pose cost (cm): sequence-level alignment cost, subsampled to max_dtw_frames.
     if enable_dtw:
         dtw_pose_cm = float(_dtw_pose_error_m(human_center, robot_aligned, max_frames=max_dtw_frames) * 100.0)
     else:
         dtw_pose_cm = float("nan")
 
+    # Quality metrics: joint limit violations, DOF acceleration, foot slip (stance only).
     joint_limit_violation_rate = _joint_limit_violation_rate(model=model, qpos_full=qpos_full)
     dof_acc_mean = _dof_acc_mean(dof_pos=dof_pos, fps=fps)
     foot_slip_cm_s = _foot_slip_cm_s(robot_tracks=robot_tracks, fps=fps)
@@ -480,47 +528,50 @@ def evaluate_robot(
 
 
 def _fmt_float(x: float, dec: int = 3) -> str:
+    """Format float for display; non-finite -> 'nan'."""
     if not np.isfinite(x):
         return "nan"
     return f"{x:.{dec}f}"
 
 
 def parse_args() -> argparse.Namespace:
+    """CLI: motion .npz, body models, robot/retargeting dir, optional DTW and output."""
     parser = argparse.ArgumentParser(
         description=(
-            "Evalua fidelidad de imitación entre motion humano (.npz) y motion retargeteado de robots (.pkl). "
-            "Calcula métricas tipo humano->robot y métricas de calidad en robot."
+            "Evaluates imitation fidelity between human motion (.npz) and retargeted robot motion (.pkl). "
+            "Calculates human->robot metrics and quality metrics in robot."
         )
     )
-    parser.add_argument("--motion-npz", type=str, required=True, help="Path al motion humano original .npz.")
+    parser.add_argument("--motion-npz", type=str, required=True, help="Path to original human motion .npz.")
     parser.add_argument(
         "--body-models-dir",
         type=str,
         default=str(ROOT / "data"),
-        help="Directorio con body_models/ (SMPLH + DMPLs).",
+        help="Directory with body_models/ (SMPLH + DMPLs).",
     )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--robot-dir", type=str, default=None, help="Carpeta de un robot (contiene robot.xml y .pkl).")
+    group.add_argument("--robot-dir", type=str, default=None, help="Directory of a robot (contains robot.xml and .pkl).")
     group.add_argument(
         "--retargeting-dir",
         type=str,
         default=None,
-        help="Carpeta con múltiples robot_XXX para evaluar y rankear.",
+        help="Directory with multiple robot_XXX to evaluate and rank.",
     )
     parser.add_argument(
         "--motion-stem",
         type=str,
         default=None,
-        help="Nombre base del pkl sin extension (si hay más de un .pkl por robot).",
+        help="Base name of pkl without extension (if there are more than one .pkl per robot).",
     )
-    parser.add_argument("--enable-dtw", action="store_true", default=False, help="Activa métrica DTW (más lenta).")
-    parser.add_argument("--max-dtw-frames", type=int, default=600, help="Máximo frames por secuencia para DTW.")
-    parser.add_argument("--output-json", type=str, default=None, help="Guarda resultados en JSON.")
-    parser.add_argument("--top-k", type=int, default=10, help="Cuántos robots mostrar en ranking.")
+    parser.add_argument("--enable-dtw", action="store_true", default=False, help="Activate DTW metric (slower).")
+    parser.add_argument("--max-dtw-frames", type=int, default=600, help="Maximum frames per sequence for DTW.")
+    parser.add_argument("--output-json", type=str, default=None, help="Save results in JSON.")
+    parser.add_argument("--top-k", type=int, default=10, help="Number of robots to show in ranking.")
     return parser.parse_args()
 
 
 def main() -> None:
+    """Load human motion, evaluate each robot dir, print ranking and optionally save JSON."""
     args = parse_args()
 
     motion_npz = Path(args.motion_npz).resolve()
@@ -529,10 +580,10 @@ def main() -> None:
     retargeting_dir = Path(args.retargeting_dir).resolve() if args.retargeting_dir else None
 
     if not motion_npz.is_file():
-        raise FileNotFoundError(f"No existe motion npz: {motion_npz}")
+        raise FileNotFoundError(f"No motion npz exists: {motion_npz}")
 
     robot_dirs = _collect_robot_dirs(robot_dir=robot_dir, retargeting_dir=retargeting_dir)
-    print(f"Evaluando {len(robot_dirs)} robot(s)...")
+    print(f"Evaluating {len(robot_dirs)} robot(s)...")
 
     human_frames_cache: Dict[float, List[Dict[str, Tuple[np.ndarray, np.ndarray]]]] = {}
     results: List[RobotEval] = []
@@ -559,7 +610,7 @@ def main() -> None:
             print(f"[FAIL] {rdir.name}: {exc}")
 
     if not results:
-        raise RuntimeError("No se pudo evaluar ningún robot.")
+        raise RuntimeError("No robot could be evaluated.")
 
     results_sorted = sorted(results, key=lambda x: x.overall_score, reverse=True)
     top_k = max(1, min(int(args.top_k), len(results_sorted)))
@@ -587,10 +638,10 @@ def main() -> None:
         out.parent.mkdir(parents=True, exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
-        print(f"\nJSON guardado en: {out}")
+        print(f"\nJSON saved in: {out}")
 
     if failures:
-        print("\nRobots con fallo:")
+        print("\nRobots with failure:")
         for robot_path, err in failures:
             print(f"- {robot_path}: {err}")
 

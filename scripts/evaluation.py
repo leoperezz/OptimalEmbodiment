@@ -14,8 +14,7 @@ if str(ROOT) not in sys.path:
 
 from scripts import retargeting as rt  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import robot2human as r2h  # noqa: E402
+from optimal_embodiment.eval import robot2human as r2h  # noqa: E402
 
 
 def _parse_seed_list(seed_list: Optional[str]) -> Optional[List[int]]:
